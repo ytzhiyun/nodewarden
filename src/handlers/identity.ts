@@ -1,4 +1,4 @@
-import { Env, TokenResponse } from '../types';
+import { Env, TokenResponse, User } from '../types';
 import { StorageService } from '../services/storage';
 import { AuthService } from '../services/auth';
 import { RateLimitService, getClientIdentifier } from '../services/ratelimit';
@@ -18,17 +18,24 @@ import {
 import { auditRequestMetadata, safeWriteAuditEvent } from '../services/audit-events';
 import {
   assertAccountPasskeyCredential,
+  assertTwoFactorPasskeyCredential,
   buildAccountPasskeyTokenUserDecryptionOption,
+  buildTwoFactorPasskeyAssertionOptions,
 } from './account-passkeys';
 import { isAuthRequestExpired } from '../services/storage-auth-request-repo';
 import { createPasskeyUserVerificationToken } from '../utils/user-verification-token';
 import { constantTimeEquals, verifyApiKey } from '../utils/api-key';
+import { isYubiKeyEnabled, userYubiKeyPublicIds, verifyYubicoOtp, yubicoCredentialsFromEnv, yubiKeyPublicIdFromOtp, type YubicoApiCredentials } from '../utils/yubico-otp';
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const TWO_FACTOR_PROVIDER_AUTHENTICATOR = 0;
+const TWO_FACTOR_PROVIDER_YUBIKEY = 3;
 const TWO_FACTOR_PROVIDER_REMEMBER = 5;
+const TWO_FACTOR_PROVIDER_WEBAUTHN = 7;
 const TWO_FACTOR_PROVIDER_RECOVERY_CODE = 8;
 const WEB_REFRESH_COOKIE = 'nodewarden_web_refresh';
+const YUBICO_CLIENT_ID_CONFIG_KEY = 'globalSettings__yubico__clientId';
+const YUBICO_KEY_CONFIG_KEY = 'globalSettings__yubico__key';
 // Some UI surfaces use -1 for the recovery-code settings dialog. Login itself follows
 // the official Identity provider enum (RecoveryCode = 8), while request parsing remains
 // compatible with older/local provider values.
@@ -115,6 +122,15 @@ function readBodyValue(body: Record<string, string>, names: string[]): string | 
   return undefined;
 }
 
+async function getStoredYubicoCredentials(storage: StorageService, env: Env): Promise<YubicoApiCredentials | null> {
+  const fromEnv = yubicoCredentialsFromEnv(env);
+  if (fromEnv) return fromEnv;
+  const clientId = String(await storage.getConfigValue(YUBICO_CLIENT_ID_CONFIG_KEY) || '').trim();
+  if (!clientId) return null;
+  const secretKey = String(await storage.getConfigValue(YUBICO_KEY_CONFIG_KEY) || '').trim();
+  return { clientId, secretKey };
+}
+
 function buildRefreshCookie(request: Request, refreshToken: string, maxAgeSeconds: number): string {
   const isHttps = new URL(request.url).protocol === 'https:';
   const parts = [
@@ -183,13 +199,32 @@ function masterPasswordPolicyResponse(): TokenResponse['MasterPasswordPolicy'] {
   };
 }
 
-function twoFactorRequiredResponse(message: string = 'Two factor required.'): Response {
+async function twoFactorRequiredResponse(
+  request: Request,
+  env: Env,
+  storage: StorageService,
+  user?: User,
+  message: string = 'Two factor required.'
+): Promise<Response> {
   // Match Bitwarden Identity: TwoFactorProviders2 lists enabled 2FA providers only.
   // Clients expose recovery-code entry points themselves; Android 2026.4 fails to
   // parse the challenge if an unknown recovery provider key such as "8" is included.
-  const providers = [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)];
-  const providers2: Record<string, { Email: null }> = {};
-  for (const provider of providers) providers2[provider] = { Email: null };
+  const providers: string[] = [];
+  let webAuthnOptions: Record<string, unknown> | null = null;
+  if (!user || resolveTotpSecret(user.totpSecret)) providers.push(String(TWO_FACTOR_PROVIDER_AUTHENTICATOR));
+  if (user && isYubiKeyEnabled(user)) providers.push(String(TWO_FACTOR_PROVIDER_YUBIKEY));
+  if (user) {
+    webAuthnOptions = await buildTwoFactorPasskeyAssertionOptions(request, env, storage, user) as Record<string, unknown> | null;
+    if (webAuthnOptions) providers.push(String(TWO_FACTOR_PROVIDER_WEBAUTHN));
+  }
+  const providers2: Record<string, Record<string, unknown> | null> = {};
+  for (const provider of providers) {
+    providers2[provider] = provider === String(TWO_FACTOR_PROVIDER_YUBIKEY)
+      ? { Nfc: user?.yubikeyNfc ?? false }
+      : provider === String(TWO_FACTOR_PROVIDER_WEBAUTHN) && webAuthnOptions
+        ? webAuthnOptions
+        : null;
+  }
   const customResponse = {
     TwoFactorProviders: providers,
     TwoFactorProviders2: providers2,
@@ -370,10 +405,12 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       );
     }
 
-    // Optional 2FA: enabled only by per-user secret.
+    // Optional 2FA: enabled by any supported per-user provider.
     let trustedTwoFactorTokenToReturn: string | undefined;
     const effectiveTotpSecret = resolveTotpSecret(user.totpSecret);
-    if (effectiveTotpSecret) {
+    const effectiveYubiKeyPublicIds = userYubiKeyPublicIds(user);
+    const effectiveWebAuthnCredentials = await storage.getAccountPasskeyCredentialsByUserId(user.id, 'twoFactor');
+    if (effectiveTotpSecret || effectiveYubiKeyPublicIds.length > 0 || effectiveWebAuthnCredentials.length > 0) {
       const normalizedTwoFactorProvider = String(twoFactorProvider ?? '').trim();
       const normalizedTwoFactorToken = String(twoFactorToken ?? '').trim();
       let rememberRequested = ['1', 'true', 'True', 'TRUE', 'on', 'yes', 'Yes', 'YES'].includes(String(twoFactorRemember || '').trim());
@@ -383,7 +420,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       // Upstream-compatible behavior: if 2FA is required and either provider or token is missing,
       // respond with a 2FA challenge payload.
       if (!hasProvider || !hasToken) {
-        return twoFactorRequiredResponse('Two factor required.');
+        return await twoFactorRequiredResponse(request, env, storage, user, 'Two factor required.');
       }
 
       let passedByRememberToken = false;
@@ -398,15 +435,42 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
 
         // Remember token missing/invalid/expired should re-enter the 2FA challenge flow.
         if (!passedByRememberToken) {
-          return twoFactorRequiredResponse('Two factor required.');
+          return await twoFactorRequiredResponse(request, env, storage, user, 'Two factor required.');
         }
       } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)) {
+        if (!effectiveTotpSecret) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
         const matchedCounter = await findMatchingTotpCounter(effectiveTotpSecret, normalizedTwoFactorToken);
         if (matchedCounter == null) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
         const consumed = await storage.consumeTotpLoginCounter(user.id, matchedCounter);
         if (!consumed) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+      } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_YUBIKEY)) {
+        const publicId = yubiKeyPublicIdFromOtp(normalizedTwoFactorToken);
+        if (!publicId || !effectiveYubiKeyPublicIds.includes(publicId)) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        const credentials = await getStoredYubicoCredentials(storage, env);
+        if (!credentials || !await verifyYubicoOtp(env, normalizedTwoFactorToken, credentials)) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+      } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_WEBAUTHN)) {
+        if (!effectiveWebAuthnCredentials.length) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        let deviceResponse: unknown;
+        try {
+          deviceResponse = JSON.parse(normalizedTwoFactorToken);
+        } catch {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        try {
+          await assertTwoFactorPasskeyCredential(request, env, storage, user, deviceResponse);
+        } catch {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
       } else if (
@@ -418,6 +482,15 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
         user.totpSecret = null;
+        user.yubikeyKey1 = null;
+        user.yubikeyKey2 = null;
+        user.yubikeyKey3 = null;
+        user.yubikeyKey4 = null;
+        user.yubikeyKey5 = null;
+        user.yubikeyNfc = false;
+        for (const credential of effectiveWebAuthnCredentials) {
+          await storage.deleteAccountPasskeyCredential(user.id, credential.id, 'twoFactor');
+        }
         user.totpRecoveryCode = createRecoveryCode();
         user.securityStamp = generateUUID();
         user.updatedAt = new Date().toISOString();

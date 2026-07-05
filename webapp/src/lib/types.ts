@@ -15,6 +15,7 @@ export interface Profile {
   name: string;
   key: string;
   masterPasswordHint?: string | null;
+  yubikeyEnabled?: boolean;
   privateKey?: string | null;
   publicKey?: string | null;
   role: 'admin' | 'user';
@@ -295,6 +296,15 @@ export interface WebBootstrapResponse {
   registrationInviteRequired?: boolean;
 }
 
+export interface YubiKeyOtpSettings {
+  enabled: boolean;
+  keys: [string, string, string, string, string];
+  nfc: boolean;
+  yubicoConfigured: boolean;
+  yubicoClientId: string;
+  yubicoSecretKey: string;
+}
+
 export interface TokenSuccess {
   access_token: string;
   refresh_token?: string;
@@ -338,6 +348,17 @@ export interface AccountPasskeyCredential {
   encryptedUserKey?: string | null;
   creationDate?: string;
   revisionDate?: string;
+}
+
+export interface TwoFactorPasskeyCredential {
+  id: number;
+  name: string;
+  migrated?: boolean;
+}
+
+export interface TwoFactorPasskeySettings {
+  enabled: boolean;
+  keys: TwoFactorPasskeyCredential[];
 }
 
 export interface AuthRequest {
